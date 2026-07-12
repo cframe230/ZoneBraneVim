@@ -4,7 +4,7 @@ English | [中文](README.md)
 
 An unofficial Vim-mode plugin for [ZeroBrane Studio](https://studio.zerobrane.com/). The single `vim.lua` file provides commonly used modal editing, motions, operators, search, tab navigation, and a small set of Ex commands. It is not an embedded Vim/Neovim instance and does not aim for complete Vim compatibility.
 
-- Current version: `0.2.2`
+- Current version: `0.3.0`
 - ZeroBrane Studio: `1.61+`
 - License: MIT
 
@@ -18,7 +18,7 @@ An unofficial Vim-mode plugin for [ZeroBrane Studio](https://studio.zerobrane.co
 | Search | Forward/backward and repeated search, search under cursor, configurable case sensitivity and wrapping |
 | File commands | Save, close, save/close all, open a file, and jump to a line |
 | Integration | Per-editor mode state, tab navigation, viewport positioning, and native ZeroBrane editing in Insert mode |
-| Registers | One internal unnamed register; yanked/deleted text can also be copied to the system clipboard |
+| Registers | Unnamed, named, append, numbered, small-delete, black-hole, clipboard, and read-only registers |
 
 ## Installation
 
@@ -42,7 +42,7 @@ mkdir -p "$HOME/.zbstudio/packages"
 cp ./vim.lua "$HOME/.zbstudio/packages/vim.lua"
 ```
 
-You may alternatively copy the file into the `packages/` directory of a specific ZeroBrane Studio installation. Restart the IDE after installation. `Vim Mode 0.2.2 registered` in the Output panel confirms that the plugin loaded.
+You may alternatively copy the file into the `packages/` directory of a specific ZeroBrane Studio installation. Restart the IDE after installation. `Vim Mode 0.3.0 registered` in the Output panel confirms that the plugin loaded.
 
 ## Configuration
 
@@ -86,6 +86,7 @@ These values are the defaults. Set `enabled = false` to load the plugin without 
 | `H M L` | Move to the top / middle / bottom of the screen |
 | `zz` / `zt` / `zb` | Position the current line at the center / top / bottom of the screen |
 | `gt` / `gT` | Next / previous tab; `[count]gt` jumps to a numbered tab |
+| `g<Tab>` | Return to the most recently visited tab |
 | `i a I A` | Enter Insert at the cursor / after it / first non-blank / line end |
 | `o O` | Open a line below / above and enter Insert |
 | `R` | Enter Replace mode |
@@ -97,12 +98,14 @@ These values are the defaults. Set `enabled = false` to load the plugin without 
 | `p P` | Paste the internal register after / before |
 | `r{char}` / `~` / `J` | Replace character / toggle case / join lines |
 | `u` / `Ctrl-R` | Undo / redo |
+| `.` / `[count].` | Repeat the latest change / repeat it a specified number of times |
+| `"{register}` | Select a register for the next operation |
 | `/` / `?` | Open the forward / backward search prompt |
 | `n N` / `* #` | Repeat search / search for text under the cursor |
 | `Ctrl-D` `Ctrl-U` | Move down / up half a screen |
 | `Ctrl-F` `Ctrl-B` | Move down / up one screen |
 | `Ctrl-E` `Ctrl-Y` | Scroll down / up one line |
-| `:` | Open the Ex command prompt |
+| `:` | Open the status-bar Ex command line |
 | `ZZ` / `ZQ` | Save and close / force-close the current file |
 
 ### Insert and Replace Modes
@@ -118,7 +121,8 @@ All three Visual modes support the motions and counts listed above, plus:
 | `v` / `V` / `Ctrl-V` | Switch to character / line / rectangular block selection; press the active mode key again to exit |
 | `o` | Swap the selection endpoints |
 | `d` or `x` | Delete the selection |
-| `c` or `s` | Change the selection and enter Insert |
+| `c` or `s` | Change the selection and enter Insert; block input is replicated to every row |
+| `I` / `A` | Insert on the left / right side of every Visual Block row |
 | `y` | Yank the selection |
 | `p` / `P` | Replace the selection with the internal register |
 | `>` / `<` / `~` | Indent / unindent / toggle case |
@@ -126,7 +130,7 @@ All three Visual modes support the motions and counts listed above, plus:
 
 ## Ex Commands
 
-Commands are entered through a ZeroBrane input dialog; this is not a full Vim command line.
+Commands are entered through a non-modal control in the status bar. Enter executes, Esc cancels, and Up/Down browse session history. `/` and `?` use the same control.
 
 | Command | Action |
 | --- | --- |
@@ -139,7 +143,9 @@ Commands are entered through a ZeroBrane input dialog; this is not a full Vim co
 | `:e {path}` / `:edit {path}` | Open a file |
 | `:tabnext` / `:tabn`, `:tabprevious` / `:tabp` | Next / previous tab |
 | `:tabfirst` / `:tablast` / `:tab {n}` | First / last / specified tab |
+| `:tabnew [path]` / `:tabclose` / `:tabonly` / `:tabs` | Create, close, keep only the current tab, or list tabs |
 | `:bnext` / `:bn`, `:bprevious` / `:bp` | Tab-navigation aliases |
+| `:registers` / `:reg` | List non-empty registers in the Output panel |
 | `:set (no)ignorecase`, `:set (no)ic` | Toggle search case sensitivity |
 | `:set (no)smartcase`, `:set (no)scs` | Toggle smart case |
 | `:set (no)wrapscan`, `:set (no)ws` | Toggle search wrapping |
@@ -147,12 +153,16 @@ Commands are entered through a ZeroBrane input dialog; this is not a full Vim co
 
 `:set` changes apply only to the current IDE session. Edit the user configuration to make them persistent.
 
+## Registers
+
+Supported registers include `"` (unnamed), `a-z` (named), `A-Z` (append), `0-9` (yank/delete history), `-` (small delete), `_` (black hole), `+/*` (system clipboard), and read-only `.` (last inserted text), `:` (last command), `/` (last search), `%` (current filename), and `#` (alternate filename). Examples: `"ayy`, `"ap`, `"_dd`, and `"+p`.
+
 ## Limitations and Shortcut Conflicts
 
-- This is a subset of Vim. Dot repeat, text objects, named registers, macros, marks/jumps, window commands, substitute commands, vimrc, and custom mappings are not implemented.
-- Visual Block supports rectangular `y/d/x/c/p/P/~/>/<`. Block `c` deletes the rectangle but enters Insert only at the top-left corner; typed text is not yet replicated to every selected row.
-- Search is literal and has no regex, incremental mode, history, completion, or result highlighting. Search and Ex commands use modal dialogs.
-- `y`, `d`, `c`, and `x` write to one internal register and may also copy to the system clipboard. `p`/`P` do not automatically read later clipboard changes made outside the plugin.
+- This is a subset of Vim. Text objects, macros, marks/jumps, window commands, substitute commands, vimrc, and custom mappings are not implemented.
+- Visual Block supports rectangular `y/d/x/c/p/P/I/A/~/>/<`. Multi-row insert replicates single-line text, but Insert operations containing a newline are not copied to the other rows.
+- Search is literal and has no regex, incremental preview, completion, or result highlighting. History lasts for the current IDE session.
+- Clipboard registers depend on the platform clipboard; plain `p/P` still read Vim's unnamed register by default.
 - The plugin safely claims `Ctrl-V` by default: it enters Visual Block in Normal/Visual modes, performs native paste in Insert/Replace, and restores the original shortcut when unloaded. Set `overridectrlv = false` to disable this behavior.
 - Other ZeroBrane global shortcuts are processed before editor events. ZeroBrane 2.01 conflicts include `Ctrl-R` (Replace), `Ctrl-U` (Comment), `Ctrl-F` (Find), `Ctrl-B` (Navigate to Symbol), `Ctrl-Y` (Redo), and `Ctrl-C` (Copy). macOS Command shortcuts are not intercepted.
 - The plugin assumes one caret and one selection. ZeroBrane multi-selection state may be collapsed.

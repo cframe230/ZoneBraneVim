@@ -1,7 +1,7 @@
 -- Vim mode for ZeroBrane Studio.
 -- Copyright (c) 2026 Fermín Chen Zheng. MIT license.
 
-local VERSION = "0.2.2"
+local VERSION = "0.3.0"
 
 local states = setmetatable({}, {__mode = "k"})
 local charhandlers = setmetatable({}, {__mode = "k"})
@@ -11,9 +11,16 @@ local runtime = {
   enabled = true,
   registered = false,
   register = {text = "", linewise = false},
+  registers = {},
   lastsearch = nil,
   searchforward = true,
   ctrlvhotkey = nil,
+  lastchange = nil,
+  replaying = false,
+  commandline = nil,
+  commandhistory = {},
+  searchhistory = {},
+  alternatedocument = nil,
   laststatus = nil,
 }
 
@@ -155,6 +162,9 @@ local function newstate(editor)
     undoopen = false,
     message = nil,
     caretperiod = editor.GetCaretPeriod and editor:GetCaretPeriod() or nil,
+    repeatcandidate = nil,
+    selectedregister = nil,
+    blockinsert = nil,
   }
   states[editor] = state
   return state
@@ -164,9 +174,13 @@ local function getstate(editor)
   return states[editor] or newstate(editor)
 end
 
+local positionatcolumn
+
 local function pendinglabel(state)
   local pending = state.pending
-  if not pending then return state.count end
+  if not pending then
+    return (state.selectedregister and ('"' .. state.selectedregister) or "") .. state.count
+  end
   if pending.kind == "operator" then
     local suffix = pending.post or ""
     if pending.stage == "g" then suffix = suffix .. "g" end
@@ -175,6 +189,7 @@ local function pendinglabel(state)
   end
   if pending.kind == "prefix" then return (pending.counttext or "") .. pending.key end
   if pending.kind == "char" then return (pending.counttext or "") .. pending.action end
+  if pending.kind == "register" then return '"' end
   return ""
 end
 
@@ -244,6 +259,7 @@ local function setmode(editor, state, mode)
     begininsertundo(editor, state)
   elseif mode == "normal" then
     state.visualanchor, state.visualcursor = nil, nil
+    state.selectedregister = nil
     if editor.SetSelectionMode and rawget(_G, "wxstc") then
       editor:SetSelectionMode(wxstc.wxSTC_SEL_STREAM)
     end
@@ -256,6 +272,52 @@ end
 
 local function leaveinsert(editor, state)
   local pos = editor:GetCurrentPos()
+  local candidate = state.repeatcandidate
+  if candidate and candidate.insertbefore and not runtime.replaying then
+    local before, after = candidate.insertbefore, editor:GetText()
+    local prefix, limit = 0, math.min(#before, #after)
+    while prefix < limit and before:byte(prefix + 1) == after:byte(prefix + 1) do
+      prefix = prefix + 1
+    end
+    while prefix > 0 do
+      local b1, b2 = before:byte(prefix + 1), after:byte(prefix + 1)
+      if (not b1 or b1 < 128 or b1 >= 192) and (not b2 or b2 < 128 or b2 >= 192) then break end
+      prefix = prefix - 1
+    end
+    local suffix = 0
+    while suffix < #before - prefix and suffix < #after - prefix
+    and before:byte(#before - suffix) == after:byte(#after - suffix) do
+      suffix = suffix + 1
+    end
+    while suffix > 0 do
+      local b1 = before:byte(#before - suffix + 1)
+      local b2 = after:byte(#after - suffix + 1)
+      if (not b1 or b1 < 128 or b1 >= 192) and (not b2 or b2 < 128 or b2 >= 192) then break end
+      suffix = suffix - 1
+    end
+    candidate.insertdelta = {
+      offset = prefix - candidate.insertorigin,
+      delete = #before - prefix - suffix,
+      text = after:sub(prefix + 1, #after - suffix),
+      caretoffset = pos - candidate.insertorigin,
+    }
+    runtime.registers["."] = {
+      text = candidate.insertdelta.text,
+      linewise = false,
+      blockwise = false,
+    }
+    local blockinsert = state.blockinsert
+    state.blockinsert = nil
+    if blockinsert and candidate.insertdelta.text ~= ""
+    and not candidate.insertdelta.text:find("[\r\n]") then
+      for _, line in ipairs(blockinsert.lines) do
+        if line ~= blockinsert.primary then
+          local insert = positionatcolumn(editor, line, blockinsert.column, true)
+          editor:InsertText(insert, candidate.insertdelta.text)
+        end
+      end
+    end
+  end
   local start = linestart(editor, editor:LineFromPosition(pos))
   if pos > start then pos = positionbefore(editor, pos) end
   setmode(editor, state, "normal")
@@ -264,6 +326,10 @@ end
 
 local function enterinsert(editor, state, pos, replace)
   editor:GotoPos(clamp(pos, 0, editor:GetLength()))
+  if state.repeatcandidate and not runtime.replaying then
+    state.repeatcandidate.insertbefore = editor:GetText()
+    state.repeatcandidate.insertorigin = editor:GetCurrentPos()
+  end
   setmode(editor, state, replace and "replace" or "insert")
 end
 
@@ -614,15 +680,111 @@ local function moveresult(editor, state, result)
   end
 end
 
-local function saveregister(text, linewise, blocklines, blockwidth)
+local function copyregister(register)
+  if not register then return {text = "", linewise = false, blockwise = false} end
+  local lines
+  if register.lines then
+    lines = {}
+    for index, value in ipairs(register.lines) do lines[index] = value end
+  end
+  return {
+    text = register.text or "",
+    linewise = register.linewise and true or false,
+    blockwise = register.blockwise and true or false,
+    lines = lines,
+    width = register.width,
+  }
+end
+
+local function clipboardtext()
+  if not rawget(_G, "wx") or not wx.wxClipboard or not wx.wxTextDataObject then return nil end
+  local clipboard = wx.wxClipboard:Get()
+  if not clipboard:Open() then return nil end
+  local data = wx.wxTextDataObject()
+  local ok = clipboard:GetData(data)
+  clipboard:Close()
+  return ok and data:GetText() or nil
+end
+
+local function storeregister(name, register, append)
+  name = name or '"'
+  local target = name:match("^[A-Z]$") and name:lower() or name
+  if append then
+    local previous = runtime.registers[target]
+    if previous and previous.text ~= "" then
+      register.text = previous.text .. register.text
+      if previous.blockwise and register.blockwise and previous.lines and register.lines then
+        local lines = {}
+        local total = math.max(#previous.lines, #register.lines)
+        for index = 1, total do
+          lines[index] = (previous.lines[index] or "") .. (register.lines[index] or "")
+        end
+        register.lines = lines
+        register.width = (previous.width or 0) + (register.width or 0)
+      end
+    end
+  end
+  runtime.registers[target] = copyregister(register)
+end
+
+local function getregister(state, editor)
+  local name = state and state.selectedregister or '"'
+  if name:match("^[A-Z]$") then name = name:lower() end
+  local register
+  if name == "+" or name == "*" then
+    local text = clipboardtext()
+    register = text and {text = text, linewise = false, blockwise = false}
+      or runtime.registers[name]
+  elseif name == "%" and rawget(_G, "ide") then
+    local document = ide:GetDocument(editor)
+    register = {text = document and (document:GetFilePath() or document:GetFileName()) or ""}
+  elseif name == "#" then
+    local document = runtime.alternatedocument
+    register = {text = document and (document:GetFilePath() or document:GetFileName()) or ""}
+  else
+    register = runtime.registers[name]
+  end
+  if name == '"' and runtime.register and runtime.register ~= runtime.registers['"'] then
+    register = runtime.register
+  end
+  return copyregister(register), name
+end
+
+local function consumeregister(state)
+  if state then state.selectedregister = nil end
+end
+
+local function saveregister(text, linewise, blocklines, blockwidth, state, operation)
   if linewise and text ~= "" and not text:match("[\r\n]$") then text = text .. "\n" end
-  runtime.register = {
+  local register = {
     text = text,
     linewise = linewise and true or false,
     blockwise = blocklines ~= nil,
     lines = blocklines,
     width = blockwidth,
   }
+  local name = state and state.selectedregister or '"'
+  local append = name:match("^[A-Z]$") ~= nil
+  consumeregister(state)
+  if name == "_" then return end
+
+  storeregister(name, copyregister(register), append)
+  runtime.registers['"'] = copyregister(register)
+  runtime.register = runtime.registers['"']
+
+  if operation == "yank" then
+    runtime.registers["0"] = copyregister(register)
+  elseif operation == "delete" or operation == "change" then
+    if linewise or text:find("[\r\n]") then
+      for index = 9, 2, -1 do
+        runtime.registers[tostring(index)] = copyregister(runtime.registers[tostring(index - 1)])
+      end
+      runtime.registers["1"] = copyregister(register)
+    else
+      runtime.registers["-"] = copyregister(register)
+    end
+  end
+
   if runtime.config.clipboard ~= false and rawget(_G, "ide") and ide.CopyToClipboard then
     pcall(function() ide:CopyToClipboard(text) end)
   end
@@ -717,7 +879,7 @@ local function applyoperator(editor, state, operator, result, startpos)
 
   local text = linewise and linewisetext(editor, first, last) or editor:GetTextRange(from, finish)
   if operator == "y" then
-    saveregister(text, linewise)
+    saveregister(text, linewise, nil, nil, state, "yank")
     gotonormal(editor, startpos)
     setstatus(editor, state, linewise and ("Vim: yanked " .. (last - first + 1) .. " line(s)")
       or ("Vim: yanked " .. #text .. " byte(s)"))
@@ -730,7 +892,7 @@ local function applyoperator(editor, state, operator, result, startpos)
     return true
   end
 
-  saveregister(text, linewise)
+  saveregister(text, linewise, nil, nil, state, operator == "c" and "change" or "delete")
   if operator == "d" then
     local cursor
     withundo(editor, function()
@@ -755,7 +917,7 @@ local function ensureline(editor, line)
   end
 end
 
-local function positionatcolumn(editor, line, column, pad)
+positionatcolumn = function(editor, line, column, pad)
   ensureline(editor, line)
   local pos = editor:FindColumn(line, column)
   local actual = editor:GetColumn(pos)
@@ -767,8 +929,7 @@ local function positionatcolumn(editor, line, column, pad)
   return pos
 end
 
-local function pasteblock(editor, state, before, count)
-  local register = runtime.register
+local function pasteblock(editor, state, before, count, register)
   if readonly(editor) or not register.lines or #register.lines == 0 then return false end
   local current = editor:GetCurrentPos()
   local firstline = editor:LineFromPosition(current)
@@ -788,9 +949,10 @@ local function pasteblock(editor, state, before, count)
 end
 
 local function paste(editor, state, before, count)
-  local register = runtime.register
+  local register = getregister(state, editor)
   if readonly(editor) or not register or register.text == "" then return false end
-  if register.blockwise then return pasteblock(editor, state, before, count) end
+  consumeregister(state)
+  if register.blockwise then return pasteblock(editor, state, before, count, register) end
   local text = repeattext(register.text, count)
   local pos = editor:GetCurrentPos()
   withundo(editor, function()
@@ -842,7 +1004,8 @@ local function deletechars(editor, state, backward, count, enter)
     if enter then enterinsert(editor, state, first, false) return true end
     return false
   end
-  saveregister(editor:GetTextRange(first, finish), false)
+  saveregister(editor:GetTextRange(first, finish), false, nil, nil, state,
+    enter and "change" or "delete")
   if enter then
     beginchange(editor, state, function() editor:DeleteRange(first, finish - first) end, first)
   else
@@ -864,7 +1027,7 @@ local function replacechars(editor, state, value, count)
     actual = actual + 1
   end
   if actual == 0 then return false end
-  saveregister(editor:GetTextRange(first, finish), false)
+  saveregister(editor:GetTextRange(first, finish), false, nil, nil, state, "change")
   withundo(editor, function()
     editor:DeleteRange(first, finish - first)
     editor:InsertText(first, repeattext(value, actual))
@@ -995,13 +1158,21 @@ local function runsearch(editor, state, query, forward, count)
     pos = found
   end
   runtime.lastsearch, runtime.searchforward = query, forward
+  runtime.registers["/"] = {text = query, linewise = false, blockwise = false}
   gotonormal(editor, pos)
   return true
 end
 
+local opencommandline
+
 local function promptsearch(editor, state, forward, count)
-  if not rawget(_G, "ide") or not ide.GetTextFromUser then return false end
   local previous = state.mode
+  if opencommandline and rawget(_G, "wx") then
+    state.mode = "search"
+    setstatus(editor, state, forward and "/" or "?")
+    if opencommandline(editor, state, forward and "/" or "?", count) then return true end
+  end
+  if not rawget(_G, "ide") or not ide.GetTextFromUser then return false end
   state.mode = "search"
   setstatus(editor, state, forward and "/" or "?")
   local query = ide:GetTextFromUser(forward and "Search forward" or "Search backward",
@@ -1034,8 +1205,21 @@ local function switchtab(editor, direction, count, absolute)
   else
     target = ((current - 1 + direction * count) % #documents) + 1
   end
-  if documents[target].SetActive then documents[target]:SetActive() return true end
+  if documents[target].SetActive then
+    if target ~= current then runtime.alternatedocument = documents[current] end
+    documents[target]:SetActive()
+    return true
+  end
   return false
+end
+
+local function switchalternatetab(editor)
+  local alternate = runtime.alternatedocument
+  if not alternate or not alternate.SetActive or not rawget(_G, "ide") then return false end
+  local current = ide:GetDocument(editor)
+  alternate:SetActive()
+  runtime.alternatedocument = current
+  return true
 end
 
 local function scrollposition(editor, where)
@@ -1059,6 +1243,8 @@ end
 local function executeex(editor, state, command)
   command = (command or ""):match("^%s*(.-)%s*$")
   if command == "" then return true end
+  runtime.lastcommand = command
+  runtime.registers[":"] = {text = command, linewise = false, blockwise = false}
   if command:match("^%d+$") then
     local line = clamp(tonumber(command) - 1, 0, linecount(editor) - 1)
     gotonormal(editor, firstnonblank(editor, line))
@@ -1107,6 +1293,44 @@ local function executeex(editor, state, command)
     return switchtab(editor, 1, 1000000, true)
   elseif command:match("^tab%s+%d+$") then
     return switchtab(editor, 1, tonumber(command:match("%d+")), true)
+  elseif command == "tabnew" then
+    if rawget(_G, "wx") and rawget(_G, "ID") and ID.NEW then
+      ide:GetMainFrame():AddPendingEvent(wx.wxCommandEvent(wx.wxEVT_COMMAND_MENU_SELECTED, ID.NEW))
+      return true
+    end
+    return false
+  elseif command:match("^tabnew%s+") then
+    return ide:LoadFile(command:match("^tabnew%s+(.+)$")) and true or false
+  elseif command == "tabclose" then
+    if doc then closewhenidle(doc, false) return true end
+  elseif command == "tabonly" then
+    if doc then
+      local closeothers = function() doc:CloseAll({keep = true, scope = "notebook"}) end
+      if ide.DoWhenIdle then ide:DoWhenIdle(closeothers) else closeothers() end
+      return true
+    end
+  elseif command == "tabs" then
+    local output = {"--- Tabs ---"}
+    for index, document in ipairs(ide:GetDocumentList()) do
+      output[#output + 1] = (document:IsActive() and "> " or "  ")
+        .. index .. "  " .. (document:GetFilePath() or document:GetFileName() or "[No Name]")
+    end
+    if ide.Print then ide:Print(table.concat(output, "\n")) end
+    return true
+  elseif command == "registers" or command == "reg" then
+    local names = {}
+    for name, register in pairs(runtime.registers) do
+      if register and register.text and register.text ~= "" then names[#names + 1] = name end
+    end
+    table.sort(names)
+    local output = {"--- Registers ---"}
+    for _, name in ipairs(names) do
+      local value = runtime.registers[name].text:gsub("\r", "\\r"):gsub("\n", "\\n")
+      output[#output + 1] = ('"%s   %s'):format(name, value)
+    end
+    if ide and ide.Print then ide:Print(table.concat(output, "\n")) end
+    setstatus(editor, state, "Vim: " .. #names .. " register(s)")
+    return true
   elseif command == "set ignorecase" or command == "set ic" then
     runtime.config.ignorecase = true
   elseif command == "set noignorecase" or command == "set noic" then
@@ -1130,7 +1354,84 @@ local function executeex(editor, state, command)
   return true
 end
 
+opencommandline = function(editor, state, prefix, count)
+  if not rawget(_G, "wx") or not rawget(_G, "ide") or not ide.GetStatusBar then
+    return false
+  end
+  if runtime.commandline and runtime.commandline.close then runtime.commandline.close(false) end
+
+  local statusbar = ide:GetStatusBar()
+  local rect = wx.wxRect()
+  statusbar:GetFieldRect(0, rect)
+  local control = wx.wxTextCtrl(statusbar, wx.wxID_ANY, prefix,
+    wx.wxPoint(rect:GetX(), rect:GetY()),
+    wx.wxSize(rect:GetWidth(), rect:GetHeight()),
+    wx.wxTE_PROCESS_ENTER + wx.wxNO_BORDER)
+  if editor.GetFont then control:SetFont(editor:GetFont()) end
+  control:SetInsertionPointEnd()
+  control:SetFocus()
+
+  local history = prefix == ":" and runtime.commandhistory or runtime.searchhistory
+  local historyindex = #history + 1
+  local closing = false
+  local function setvalue(value)
+    control:ChangeValue(prefix .. (value or ""))
+    control:SetInsertionPointEnd()
+  end
+  local function close(execute)
+    if closing then return end
+    closing = true
+    local value = control:GetValue()
+    if value:sub(1, 1) == prefix then value = value:sub(2) end
+    runtime.commandline = nil
+    control:Destroy()
+    if ide.IsValidCtrl == nil or ide:IsValidCtrl(editor) then editor:SetFocus() end
+    state.mode = "normal"
+    setcaret(editor, state)
+    if not execute or value == "" then setstatus(editor, state) return end
+    if history[#history] ~= value then history[#history + 1] = value end
+    if prefix == ":" then executeex(editor, state, value)
+    else runsearch(editor, state, value, prefix == "/", count or 1) end
+  end
+  runtime.commandline = {control = control, close = close, prefix = prefix}
+
+  control:Connect(wx.wxEVT_KEY_DOWN, function(event)
+    local key = event:GetKeyCode()
+    if key == wx.WXK_ESCAPE then close(false)
+    elseif key == wx.WXK_UP then
+      if #history > 0 then
+        historyindex = math.max(1, historyindex - 1)
+        setvalue(history[historyindex])
+      end
+    elseif key == wx.WXK_DOWN then
+      if historyindex < #history then
+        historyindex = historyindex + 1
+        setvalue(history[historyindex])
+      else
+        historyindex = #history + 1
+        setvalue("")
+      end
+    elseif key == wx.WXK_HOME then
+      control:SetInsertionPoint(1)
+    elseif key == wx.WXK_BACK and control:GetInsertionPoint() <= 1 then
+      return
+    else
+      event:Skip()
+    end
+  end)
+  control:Connect(wx.wxEVT_COMMAND_TEXT_ENTER, function() close(true) end)
+  control:Connect(wx.wxEVT_KILL_FOCUS, function()
+    if not closing and runtime.commandline and runtime.commandline.control == control then close(false) end
+  end)
+  return true
+end
+
 local function promptex(editor, state)
+  if opencommandline and rawget(_G, "wx") then
+    state.mode = "command"
+    setstatus(editor, state, ":")
+    if opencommandline(editor, state, ":", 1) then return true end
+  end
   if not rawget(_G, "ide") or not ide.GetTextFromUser then return false end
   state.mode = "command"
   setstatus(editor, state, ":")
@@ -1157,12 +1458,27 @@ local function deleteblockranges(editor, ranges)
   end
 end
 
+local function makeblockinsert(firstline, lastline, column)
+  local lines = {}
+  for line = firstline, lastline do lines[#lines + 1] = line end
+  return {lines = lines, primary = firstline, column = column}
+end
+
+local function startvisualblockinsert(editor, state, after)
+  local _, _, firstline, lastline, firstcol, lastcol = collectblock(editor, state)
+  local column = after and lastcol + 1 or firstcol
+  state.blockinsert = makeblockinsert(firstline, lastline, column)
+  local pos = positionatcolumn(editor, firstline, column, true)
+  enterinsert(editor, state, pos, false)
+  return true
+end
+
 local function applyvisualblock(editor, state, operator)
   local ranges, lines, firstline, lastline, firstcol, lastcol = collectblock(editor, state)
   local text = table.concat(lines, geteol(editor))
   local cursor = positionatcolumn(editor, firstline, firstcol, false)
   if operator == "y" then
-    saveregister(text, false, lines, lastcol - firstcol + 1)
+    saveregister(text, false, lines, lastcol - firstcol + 1, state, "yank")
     setmode(editor, state, "normal")
     gotonormal(editor, cursor)
     setstatus(editor, state, "Vim: yanked block " .. #lines .. "x" .. (lastcol - firstcol + 1))
@@ -1187,8 +1503,10 @@ local function applyvisualblock(editor, state, operator)
     gotonormal(editor, cursor)
     return true
   elseif operator == "d" or operator == "c" then
-    saveregister(text, false, lines, lastcol - firstcol + 1)
+    saveregister(text, false, lines, lastcol - firstcol + 1, state,
+      operator == "c" and "change" or "delete")
     if operator == "c" then
+      state.blockinsert = makeblockinsert(firstline, lastline, firstcol)
       beginchange(editor, state, function() deleteblockranges(editor, ranges) end, cursor)
     else
       withundo(editor, function() deleteblockranges(editor, ranges) end)
@@ -1206,7 +1524,7 @@ local function applyvisual(editor, state, operator)
   local from, finish, linewise, first, last = visualrange(editor, state)
   local text = linewise and linewisetext(editor, first, last) or editor:GetTextRange(from, finish)
   if operator == "y" then
-    saveregister(text, linewise)
+    saveregister(text, linewise, nil, nil, state, "yank")
     setmode(editor, state, "normal")
     gotonormal(editor, from)
     setstatus(editor, state, linewise and ("Vim: yanked " .. (last - first + 1) .. " line(s)")
@@ -1225,7 +1543,8 @@ local function applyvisual(editor, state, operator)
     gotonormal(editor, from)
     return true
   elseif operator == "d" or operator == "c" then
-    saveregister(text, linewise)
+    saveregister(text, linewise, nil, nil, state,
+      operator == "c" and "change" or "delete")
     if operator == "c" and linewise then
       beginchange(editor, state, function() changelinewise(editor, first, last) end)
     else
@@ -1247,10 +1566,10 @@ local function applyvisual(editor, state, operator)
   return false
 end
 
-local function pastevisualblock(editor, state)
-  if readonly(editor) or runtime.register.text == "" then return false end
+local function pastevisualblock(editor, state, register)
+  if readonly(editor) or register.text == "" then return false end
   local ranges, _, firstline, _, firstcol = collectblock(editor, state)
-  local source = runtime.register.lines or {runtime.register.text}
+  local source = register.lines or {register.text}
   local cursor = positionatcolumn(editor, firstline, firstcol, false)
   withundo(editor, function()
     deleteblockranges(editor, ranges)
@@ -1267,10 +1586,12 @@ local function pastevisualblock(editor, state)
 end
 
 local function pastevisual(editor, state)
-  if readonly(editor) or runtime.register.text == "" then return false end
-  if state.mode == "visual_block" then return pastevisualblock(editor, state) end
+  local register = getregister(state, editor)
+  if readonly(editor) or register.text == "" then return false end
+  consumeregister(state)
+  if state.mode == "visual_block" then return pastevisualblock(editor, state, register) end
   local from, finish = visualrange(editor, state)
-  local text = runtime.register.text
+  local text = register.text
   withundo(editor, function()
     editor:DeleteRange(from, finish - from)
     editor:InsertText(from, text)
@@ -1282,6 +1603,8 @@ local function pastevisual(editor, state)
 end
 
 local normaldispatch
+local dispatch
+local dispatchcore
 
 local function validcharargument(key, allowreturn)
   if allowreturn and key == "<CR>" then return true end
@@ -1350,6 +1673,17 @@ end
 
 local function handlenormalpending(editor, state, key)
   local pending = state.pending
+  if pending.kind == "register" then
+    if key:match('^[%w"%+%*_%-%./:%%#]$') then
+      state.selectedregister = key
+      state.pending = nil
+      setstatus(editor, state)
+    else
+      resetpending(state)
+      setstatus(editor, state, "Vim: invalid register " .. key)
+    end
+    return true
+  end
   if pending.kind == "operator" then return handleoperatorpending(editor, state, key) end
   if key == "<Esc>" then resetpending(state) setstatus(editor, state) return true end
 
@@ -1363,6 +1697,8 @@ local function handlenormalpending(editor, state, key)
         switchtab(editor, 1, count, had)
       elseif key == "T" then
         switchtab(editor, -1, count, false)
+      elseif key == "<Tab>" then
+        switchalternatetab(editor)
       else
         setstatus(editor, state, "Vim: unknown command g" .. key)
       end
@@ -1406,6 +1742,45 @@ local function handlenormalpending(editor, state, key)
   return false
 end
 
+local function replaylastchange(editor, state, count)
+  local change = runtime.lastchange
+  if not change then
+    setstatus(editor, state, "Vim: no previous change")
+    return false
+  end
+  runtime.replaying = true
+  local ok, message = pcall(function()
+    for _ = 1, count do
+      if state.mode ~= "normal" then setmode(editor, state, "normal") end
+      for _, key in ipairs(change.keys) do dispatchcore(editor, key) end
+      if state.mode == "insert" or state.mode == "replace" then
+        local delta = change.insertdelta
+        local origin = editor:GetCurrentPos()
+        if delta then
+          local target = clamp(origin + delta.offset, 0, editor:GetLength())
+          if delta.delete > 0 then editor:DeleteRange(target, delta.delete) end
+          if delta.text ~= "" then editor:InsertText(target, delta.text) end
+          editor:GotoPos(clamp(origin + delta.caretoffset, 0, editor:GetLength()))
+          local blockinsert = state.blockinsert
+          if blockinsert and delta.text ~= "" and not delta.text:find("[\r\n]") then
+            for _, line in ipairs(blockinsert.lines) do
+              if line ~= blockinsert.primary then
+                local insert = positionatcolumn(editor, line, blockinsert.column, true)
+                editor:InsertText(insert, delta.text)
+              end
+            end
+          end
+          state.blockinsert = nil
+        end
+        leaveinsert(editor, state)
+      end
+    end
+  end)
+  runtime.replaying = false
+  if not ok then error(message, 0) end
+  return true
+end
+
 local function simplenormal(editor, state, key, count, hadcount)
   local result = resolvemotion(editor, state, key, count, nil, hadcount)
   if result then moveresult(editor, state, result) return true end
@@ -1443,6 +1818,7 @@ local function simplenormal(editor, state, key, count, hadcount)
   elseif key == "<C-r>" then
     for _ = 1, count do if not editor.CanRedo or editor:CanRedo() then editor:Redo() end end
     gotonormal(editor, editor:GetCurrentPos())
+  elseif key == "." then replaylastchange(editor, state, count)
   elseif key == "~" then togglechars(editor, count)
   elseif key == "J" then joinlines(editor, hadcount and math.max(1, count - 1) or 1)
   elseif key == ":" then promptex(editor, state)
@@ -1485,7 +1861,11 @@ normaldispatch = function(editor, state, key)
   local counttext = state.count
   local count, hadcount = countvalue(counttext), counttext ~= ""
   state.count = ""
-  if key == "d" or key == "c" or key == "y" or key == ">" or key == "<" then
+  if key == '"' then
+    state.pending = {kind = "register"}
+    setstatus(editor, state)
+    return true
+  elseif key == "d" or key == "c" or key == "y" or key == ">" or key == "<" then
     state.pending = {kind = "operator", op = key, pre = count, post = "", stage = "motion"}
     setstatus(editor, state)
     return true
@@ -1500,6 +1880,10 @@ normaldispatch = function(editor, state, key)
   end
 
   local handled = simplenormal(editor, state, key, count, hadcount)
+  if state.mode ~= "visual" and state.mode ~= "visual_line" and state.mode ~= "visual_block"
+  and not state.pending then
+    state.selectedregister = nil
+  end
   resetpending(state)
   if handled and not state.message and state.mode == "normal" then setstatus(editor, state) end
   return true -- unknown printable keys are deliberately swallowed in Normal mode.
@@ -1530,6 +1914,8 @@ local function visualdispatch(editor, state, key)
     state.visualanchor, state.visualcursor = state.visualcursor, state.visualanchor
     refreshvisual(editor, state)
     return true
+  elseif state.mode == "visual_block" and (key == "I" or key == "A") then
+    return startvisualblockinsert(editor, state, key == "A")
   elseif key == "d" or key == "x" then return applyvisual(editor, state, "d")
   elseif key == "c" or key == "s" then return applyvisual(editor, state, "c")
   elseif key == "y" then return applyvisual(editor, state, "y")
@@ -1575,7 +1961,7 @@ local function visualdispatch(editor, state, key)
   return true
 end
 
-local function dispatch(editor, key)
+dispatchcore = function(editor, key)
   if not runtime.enabled then return false end
   local state = getstate(editor)
   if state.mode == "insert" or state.mode == "replace" then
@@ -1588,6 +1974,41 @@ local function dispatch(editor, key)
     return visualdispatch(editor, state, key)
   end
   return normaldispatch(editor, state, key)
+end
+
+dispatch = function(editor, key)
+  local state = getstate(editor)
+  local candidate = state.repeatcandidate
+  local mode = state.mode
+  local canstart = mode == "normal" or mode == "visual"
+    or mode == "visual_line" or mode == "visual_block"
+  if not runtime.replaying and key ~= "." and key ~= ":" and key ~= "/" and key ~= "?" then
+    if not candidate and canstart then
+      candidate = {before = editor:GetText(), keys = {}}
+      state.repeatcandidate = candidate
+    end
+    if candidate and mode ~= "insert" and mode ~= "replace" then
+      candidate.keys[#candidate.keys + 1] = key
+    end
+  end
+
+  local handled = dispatchcore(editor, key)
+  candidate = state.repeatcandidate
+  if candidate and not runtime.replaying then
+    local ongoing = state.mode == "insert" or state.mode == "replace"
+      or state.mode == "visual" or state.mode == "visual_line" or state.mode == "visual_block"
+      or state.pending ~= nil or state.count ~= "" or state.selectedregister ~= nil
+    if not ongoing then
+      if editor:GetText() ~= candidate.before then
+        runtime.lastchange = {
+          keys = candidate.keys,
+          insertdelta = candidate.insertdelta,
+        }
+      end
+      state.repeatcandidate = nil
+    end
+  end
+  return handled
 end
 
 local function utf8char(code)
@@ -1714,13 +2135,14 @@ local plugin = {
   name = "Vim Mode",
   description = "Modal Vim-style editing for ZeroBrane Studio.",
   author = "ZoneBraneVim contributors",
-  version = 0.22,
+  version = 0.3,
   dependencies = 1.61,
 
   onRegister = function(self)
     runtime.config = self:GetConfig() or {}
     runtime.enabled = runtime.config.enabled ~= false
     runtime.registered = true
+    runtime.registers['"'] = runtime.register
     for _, document in ipairs(ide:GetDocumentList()) do connecteditor(document:GetEditor()) end
     if runtime.enabled then installctrlvhotkey() end
     ide:Print("Vim Mode " .. VERSION .. " registered")
@@ -1728,6 +2150,7 @@ local plugin = {
 
   onUnRegister = function(self)
     runtime.registered = false
+    if runtime.commandline and runtime.commandline.close then runtime.commandline.close(false) end
     restorectrlvhotkey()
     for _, document in ipairs(ide:GetDocumentList()) do disconnecteditor(document:GetEditor()) end
     if runtime.laststatus and ide:GetStatus(0) == runtime.laststatus then ide:SetStatus("", 0) end
@@ -1781,6 +2204,14 @@ plugin._test = {
     runtime.config = {status = false, clipboard = false, wrapscan = true, smartcase = true}
     runtime.enabled, runtime.registered = true, true
     runtime.register = {text = "", linewise = false, blockwise = false}
+    runtime.registers = {['"'] = runtime.register}
+    runtime.lastchange = nil
+    runtime.replaying = false
+    runtime.commandline = nil
+    runtime.commandhistory = {}
+    runtime.searchhistory = {}
+    runtime.alternatedocument = nil
+    runtime.lastcommand = nil
     runtime.ctrlvhotkey = nil
     runtime.lastsearch, runtime.searchforward = nil, true
     states = setmetatable({}, {__mode = "k"})
