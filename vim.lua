@@ -1,7 +1,7 @@
 -- Vim mode for ZeroBrane Studio.
 -- Copyright (c) 2026 Fermín Chen Zheng. MIT license.
 
-local VERSION = "0.2.1"
+local VERSION = "0.2.2"
 
 local states = setmetatable({}, {__mode = "k"})
 local charhandlers = setmetatable({}, {__mode = "k"})
@@ -1577,10 +1577,6 @@ end
 
 local function dispatch(editor, key)
   if not runtime.enabled then return false end
-  if key == "<CapsLock>" then
-    if runtime.config.capsescape == false then return false end
-    key = "<Esc>"
-  end
   local state = getstate(editor)
   if state.mode == "insert" or state.mode == "replace" then
     if key == "<Esc>" or key == "<C-[>" or key == "<C-c>" then
@@ -1632,7 +1628,6 @@ local function specialkey(event)
     return event.ShiftDown and event:ShiftDown() and "<S-Tab>" or "<Tab>"
   end
   local keys = {
-    [wxlib.WXK_CAPITAL] = "<CapsLock>",
     [wxlib.WXK_ESCAPE] = "<Esc>", [wxlib.WXK_LEFT] = "<Left>",
     [wxlib.WXK_RIGHT] = "<Right>", [wxlib.WXK_UP] = "<Up>",
     [wxlib.WXK_DOWN] = "<Down>", [wxlib.WXK_HOME] = "<Home>",
@@ -1719,7 +1714,7 @@ local plugin = {
   name = "Vim Mode",
   description = "Modal Vim-style editing for ZeroBrane Studio.",
   author = "ZoneBraneVim contributors",
-  version = 0.21,
+  version = 0.22,
   dependencies = 1.61,
 
   onRegister = function(self)

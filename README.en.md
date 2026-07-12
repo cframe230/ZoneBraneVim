@@ -4,7 +4,7 @@ English | [中文](README.md)
 
 An unofficial Vim-mode plugin for [ZeroBrane Studio](https://studio.zerobrane.com/). The single `vim.lua` file provides commonly used modal editing, motions, operators, search, tab navigation, and a small set of Ex commands. It is not an embedded Vim/Neovim instance and does not aim for complete Vim compatibility.
 
-- Current version: `0.2.1`
+- Current version: `0.2.2`
 - ZeroBrane Studio: `1.61+`
 - License: MIT
 
@@ -42,7 +42,7 @@ mkdir -p "$HOME/.zbstudio/packages"
 cp ./vim.lua "$HOME/.zbstudio/packages/vim.lua"
 ```
 
-You may alternatively copy the file into the `packages/` directory of a specific ZeroBrane Studio installation. Restart the IDE after installation. `Vim Mode 0.2.1 registered` in the Output panel confirms that the plugin loaded.
+You may alternatively copy the file into the `packages/` directory of a specific ZeroBrane Studio installation. Restart the IDE after installation. `Vim Mode 0.2.2 registered` in the Output panel confirms that the plugin loaded.
 
 ## Configuration
 
@@ -52,7 +52,6 @@ Open `Edit | Preferences | Settings: User`, add the Lua configuration below, and
 vim = {
   enabled = true,       -- enable the plugin
   startinsert = false,  -- start new editors in Insert mode
-  capsescape = true,    -- map Caps Lock to Esc
   cursorblink = false,  -- disable caret blinking
   visualblock = true,   -- enable Ctrl-V Visual Block
   overridectrlv = true, -- claim Ctrl-V; it still pastes in Insert/Replace
@@ -108,9 +107,7 @@ These values are the defaults. Set `enabled = false` to load the plugin without 
 
 ### Insert and Replace Modes
 
-Regular input and ZeroBrane Studio's native editing behavior remain available. `Tab` and `Shift-Tab` perform native indentation. Press `Caps Lock`, `Esc`, `Ctrl-[`, or `Ctrl-C` to return to Normal mode. Caps Lock also acts as Esc in Normal and Visual modes. Set `vim.capsescape = false` to disable this mapping.
-
-Caps Lock may still toggle the operating system's capitalization state or keyboard LED; that behavior is controlled by the OS/keyboard driver.
+Regular input and ZeroBrane Studio's native editing behavior remain available. `Tab` and `Shift-Tab` perform native indentation. Press `Esc`, `Ctrl-[`, or `Ctrl-C` to return to Normal mode.
 
 ### Visual, Visual Line, and Visual Block Modes
 
