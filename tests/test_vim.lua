@@ -314,6 +314,46 @@ test("visual delete works in both characterwise and linewise modes", function()
   equal(seam.runtime.register.linewise, true)
 end)
 
+test("Visual Block yanks, deletes, and puts rectangular text", function()
+  _G.wxstc = {wxSTC_SEL_STREAM = 0, wxSTC_SEL_RECTANGLE = 1, wxSTC_SEL_LINES = 2}
+  local original = "abcd\nabXd\nabcd"
+  local value = editor(original)
+  value:GotoPos(1)
+  press(value, "<C-v>", "2", "j", "2", "l", "y")
+  equal(seam.runtime.register.blockwise, true)
+  equal(table.concat(seam.runtime.register.lines, "|"), "bcd|bXd|bcd")
+  equal(seam.runtime.register.width, 3)
+  equal(seam.getstate(value).mode, "normal")
+
+  value:GotoPos(1)
+  press(value, "<C-v>", "2", "j", "2", "l", "d")
+  equal(value:GetText(), "a\na\na")
+  equal(seam.runtime.register.blockwise, true)
+  press(value, "p")
+  equal(value:GetText(), original)
+end)
+
+test("Visual Block tolerates short lines and supports case changes", function()
+  local value = editor("abcd\nx\nABCD")
+  value:GotoPos(1)
+  press(value, "<C-v>", "2", "j", "l", "~")
+  equal(value:GetText(), "aBCd\nx\nAbcD")
+  equal(seam.getstate(value).mode, "normal")
+end)
+
+test("Visual Block put replaces each selected row", function()
+  local source = editor("abcd\nABCD")
+  source:GotoPos(1)
+  press(source, "<C-v>", "j", "l", "y")
+  equal(table.concat(seam.runtime.register.lines, "|"), "bc|BC")
+
+  local target = editor("wxyz\nWXYZ")
+  target:GotoPos(1)
+  press(target, "<C-v>", "j", "l", "p")
+  equal(target:GetText(), "wbcz\nWBCZ")
+  equal(seam.getstate(target).mode, "normal")
+end)
+
 test("linewise shift operators apply the configured indentation", function()
   local value = editor("a\n  b\nc", {indent = 2})
   press(value, "2", ">", ">")
@@ -344,6 +384,55 @@ test("star, n, N, and hash search with ignorecase and wrapping", function()
   press(value, "*")
   equal(value:GetCurrentPos(), 6)
   equal(value.searchflags, 4, "smartcase retains case sensitivity")
+end)
+
+test("gt, gT, counts, and Ex commands switch editor tabs", function()
+  local first, second, third = editor("one"), editor("two"), editor("three")
+  local active = 2
+  local documents = {}
+  for index, value in ipairs({first, second, third}) do
+    documents[index] = {
+      GetEditor = function() return value end,
+      SetActive = function() active = index end,
+    }
+  end
+  _G.ide = {
+    GetDocumentList = function() return documents end,
+    GetDocument = function() return nil end,
+  }
+
+  press(second, "g", "t")
+  equal(active, 3)
+  press(third, "g", "T")
+  equal(active, 2)
+  press(second, "1", "g", "t")
+  equal(active, 1, "a count before gt jumps to an absolute tab")
+  press(first, "2", "g", "T")
+  equal(active, 2, "a count before gT moves backwards with wraparound")
+
+  local state = seam.getstate(second)
+  truthy(seam.executeex(second, state, "tablast"))
+  equal(active, 3)
+  truthy(seam.executeex(third, seam.getstate(third), "tab 2"))
+  equal(active, 2)
+  truthy(seam.executeex(second, state, "tabprevious"))
+  equal(active, 1)
+end)
+
+test("zz, zt, and zb position the viewport without moving the caret", function()
+  local lines = {}
+  for index = 1, 30 do lines[index] = "line" .. index end
+  local value = editor(table.concat(lines, "\n"), {visiblelines = 10})
+  value:GotoPos(value:PositionFromLine(20))
+  local caret = value:GetCurrentPos()
+  press(value, "z", "t")
+  equal(value.firstvisible, 20)
+  press(value, "z", "z")
+  equal(value.firstvisible, 15)
+  equal(value.centercount, 1)
+  press(value, "z", "b")
+  equal(value.firstvisible, 11)
+  equal(value:GetCurrentPos(), caret)
 end)
 
 test("Ex commands handle line jumps, settings, writes, and forced quits", function()
@@ -416,7 +505,7 @@ end)
 
 test("plugin lifecycle connects character input and handles special keys", function()
   local value = editor("abc")
-  local printed = {}
+  local printed, ctrlvcallback, restored = {}, nil, nil
   _G.wx = {
     wxEVT_CHAR = 1, wxID_ANY = -1,
     WXK_TAB = 9,
@@ -431,11 +520,24 @@ test("plugin lifecycle connects character input and handles special keys", funct
     Print = function(self, message) printed[#printed + 1] = message end,
     GetStatus = function() return "" end,
     SetStatus = function() end,
+    GetHotKey = function(self, shortcut)
+      equal(shortcut, "Ctrl-V")
+      return 99, "Ctrl-V"
+    end,
+    SetHotKey = function(self, action, shortcut)
+      equal(shortcut, "Ctrl-V")
+      if type(action) == "function" then ctrlvcallback = action return 100 end
+      restored = action
+      return action
+    end,
+    GetEditorWithFocus = function() return value end,
+    GetEditor = function() return value end,
   }
   local oldconfig = plugin.GetConfig
   plugin.GetConfig = function() return {status = false, clipboard = false} end
   plugin:onRegister()
   truthy(value.handler, "character handler was connected")
+  truthy(ctrlvcallback, "Ctrl-V hotkey was connected")
   equal(value.caretperiod, 0)
   local character = {
     GetUnicodeKey = function() return string.byte("i") end,
@@ -465,9 +567,13 @@ test("plugin lifecycle connects character input and handles special keys", funct
     ShiftDown = function() return false end,
   }
   equal(plugin:onEditorKeyDown(value, tab), false, "Normal mode consumes Tab")
+  ctrlvcallback()
+  equal(seam.getstate(value).mode, "visual_block")
+  press(value, "<Esc>")
   plugin:onUnRegister()
   equal(value.handler, nil)
   equal(value.caretperiod, 500, "unregister restores the original blink period")
+  equal(restored, 99, "unregister restores the original Ctrl-V hotkey")
   equal(#printed, 2)
   plugin.GetConfig = oldconfig
 end)

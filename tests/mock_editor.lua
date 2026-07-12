@@ -72,6 +72,9 @@ function Editor.new(text, options)
   self.targetstart, self.targetend, self.searchflags = 0, 0, 4
   self.scrollx, self.scrolly = 0, 0
   self.ensurecount = 0
+  self.selectionmode = 0
+  self.rectanchor, self.rectcaret = 0, 0
+  self.centercount = 0
   return self
 end
 
@@ -179,6 +182,10 @@ function Editor:GotoPos(position)
   self.anchor = self.current
 end
 
+function Editor:SetCurrentPos(position)
+  self.current = clamp(position, 0, #self.text)
+end
+
 function Editor:SetEmptySelection(position)
   self:GotoPos(position)
 end
@@ -186,6 +193,18 @@ end
 function Editor:SetSelection(first, finish)
   self.anchor = clamp(first, 0, #self.text)
   self.current = clamp(finish, 0, #self.text)
+end
+
+function Editor:SetSelectionMode(mode)
+  self.selectionmode = mode
+end
+
+function Editor:SetRectangularSelectionAnchor(position)
+  self.rectanchor = clamp(position, 0, #self.text)
+end
+
+function Editor:SetRectangularSelectionCaret(position)
+  self.rectcaret = clamp(position, 0, #self.text)
 end
 
 function Editor:GetSelectionStart()
@@ -352,6 +371,24 @@ end
 
 function Editor:LinesOnScreen()
   return self.visiblelines
+end
+
+function Editor:VisibleFromDocLine(line)
+  return line
+end
+
+function Editor:DocLineFromVisible(line)
+  return line
+end
+
+function Editor:SetFirstVisibleLine(line)
+  self.firstvisible = math.max(0, line)
+end
+
+function Editor:VerticalCentreCaret()
+  self.centercount = self.centercount + 1
+  local line = self:LineFromPosition(self.current)
+  self.firstvisible = math.max(0, line - math.floor(self.visiblelines / 2))
 end
 
 function Editor:LineScroll(horizontal, vertical)

@@ -1,7 +1,7 @@
 -- Vim mode for ZeroBrane Studio.
 -- Copyright (c) 2026 Fermín Chen Zheng. MIT license.
 
-local VERSION = "0.1.0"
+local VERSION = "0.2.0"
 
 local states = setmetatable({}, {__mode = "k"})
 local charhandlers = setmetatable({}, {__mode = "k"})
@@ -13,8 +13,9 @@ local runtime = {
   register = {text = "", linewise = false},
   lastsearch = nil,
   searchforward = true,
-    laststatus = nil,
-  }
+  ctrlvhotkey = nil,
+  laststatus = nil,
+}
 
 local function clamp(value, low, high)
   if value < low then return low end
@@ -182,6 +183,7 @@ local function modelabel(state)
   if state.mode == "replace" then return "-- REPLACE --" end
   if state.mode == "visual" then return "-- VISUAL --" end
   if state.mode == "visual_line" then return "-- VISUAL LINE --" end
+  if state.mode == "visual_block" then return "-- VISUAL BLOCK --" end
   if state.mode == "command" then return ":" end
   if state.mode == "search" then return "/" end
   local pending = pendinglabel(state)
@@ -235,10 +237,16 @@ local function setmode(editor, state, mode)
   resetpending(state)
 
   if mode == "insert" or mode == "replace" then
+    if editor.SetSelectionMode and rawget(_G, "wxstc") then
+      editor:SetSelectionMode(wxstc.wxSTC_SEL_STREAM)
+    end
     if mode == "replace" and editor.SetOvertype then editor:SetOvertype(true) end
     begininsertundo(editor, state)
   elseif mode == "normal" then
     state.visualanchor, state.visualcursor = nil, nil
+    if editor.SetSelectionMode and rawget(_G, "wxstc") then
+      editor:SetSelectionMode(wxstc.wxSTC_SEL_STREAM)
+    end
     editor:SetEmptySelection(clampnormal(editor, editor:GetCurrentPos()))
   end
 
@@ -276,14 +284,29 @@ local function refreshvisual(editor, state)
   anchor, cursor = clampnormal(editor, anchor), clampnormal(editor, cursor)
   state.visualanchor, state.visualcursor = anchor, cursor
 
-  if state.mode == "visual_line" then
+  if state.mode == "visual_block" then
+    if editor.SetSelectionMode and rawget(_G, "wxstc") then
+      editor:SetSelectionMode(wxstc.wxSTC_SEL_RECTANGLE)
+    end
+    if editor.SetRectangularSelectionAnchor then editor:SetRectangularSelectionAnchor(anchor) end
+    if editor.SetRectangularSelectionCaret then editor:SetRectangularSelectionCaret(cursor) end
+  elseif state.mode == "visual_line" then
+    if editor.SetSelectionMode and rawget(_G, "wxstc") then
+      editor:SetSelectionMode(wxstc.wxSTC_SEL_LINES)
+    end
     local first = math.min(editor:LineFromPosition(anchor), editor:LineFromPosition(cursor))
     local last = math.max(editor:LineFromPosition(anchor), editor:LineFromPosition(cursor))
     local finish = last + 1 < linecount(editor) and linestart(editor, last + 1) or editor:GetLength()
     editor:SetSelection(linestart(editor, first), finish)
   elseif cursor >= anchor then
+    if editor.SetSelectionMode and rawget(_G, "wxstc") then
+      editor:SetSelectionMode(wxstc.wxSTC_SEL_STREAM)
+    end
     editor:SetSelection(anchor, inclusiveend(editor, cursor))
   else
+    if editor.SetSelectionMode and rawget(_G, "wxstc") then
+      editor:SetSelectionMode(wxstc.wxSTC_SEL_STREAM)
+    end
     editor:SetSelection(inclusiveend(editor, anchor), cursor)
   end
   editor:EnsureCaretVisible()
@@ -297,6 +320,37 @@ local function entervisual(editor, state, linewise)
   setcaret(editor, state)
   refreshvisual(editor, state)
   setstatus(editor, state)
+end
+
+local function entervisualblock(editor, state)
+  local pos = clampnormal(editor, editor:GetCurrentPos())
+  state.mode = "visual_block"
+  state.visualanchor, state.visualcursor = pos, pos
+  resetpending(state)
+  setcaret(editor, state)
+  refreshvisual(editor, state)
+  setstatus(editor, state)
+end
+
+local function visualblockranges(editor, state)
+  local anchor, cursor = state.visualanchor, state.visualcursor
+  local firstline = math.min(editor:LineFromPosition(anchor), editor:LineFromPosition(cursor))
+  local lastline = math.max(editor:LineFromPosition(anchor), editor:LineFromPosition(cursor))
+  local firstcol = math.min(editor:GetColumn(anchor), editor:GetColumn(cursor))
+  local lastcol = math.max(editor:GetColumn(anchor), editor:GetColumn(cursor))
+  local ranges = {}
+  for line = firstline, lastline do
+    local from = editor:FindColumn(line, firstcol)
+    local actualcol = editor:GetColumn(from)
+    local finish = from
+    if actualcol >= firstcol and from < lineend(editor, line) then
+      local lastpos = editor:FindColumn(line, lastcol)
+      finish = lastpos < lineend(editor, line) and positionafter(editor, lastpos)
+        or lineend(editor, line)
+    end
+    ranges[#ranges + 1] = {line = line, from = from, finish = finish}
+  end
+  return ranges, firstline, lastline, firstcol, lastcol
 end
 
 local function visualrange(editor, state)
@@ -473,6 +527,7 @@ end
 
 local function resolvemotion(editor, state, key, count, argument, hadcount)
   local invisual = state.mode == "visual" or state.mode == "visual_line"
+    or state.mode == "visual_block"
   local pos = invisual and state.visualcursor or editor:GetCurrentPos()
   local result = {pos = pos, inclusive = false, linewise = false, vertical = false,
     allowemptychange = false}
@@ -551,7 +606,7 @@ local function resolvemotion(editor, state, key, count, argument, hadcount)
 end
 
 local function moveresult(editor, state, result)
-  if state.mode == "visual" or state.mode == "visual_line" then
+  if state.mode == "visual" or state.mode == "visual_line" or state.mode == "visual_block" then
     state.visualcursor = clampnormal(editor, result.pos)
     refreshvisual(editor, state)
   else
@@ -559,9 +614,15 @@ local function moveresult(editor, state, result)
   end
 end
 
-local function saveregister(text, linewise)
+local function saveregister(text, linewise, blocklines, blockwidth)
   if linewise and text ~= "" and not text:match("[\r\n]$") then text = text .. "\n" end
-  runtime.register = {text = text, linewise = linewise and true or false}
+  runtime.register = {
+    text = text,
+    linewise = linewise and true or false,
+    blockwise = blocklines ~= nil,
+    lines = blocklines,
+    width = blockwidth,
+  }
   if runtime.config.clipboard ~= false and rawget(_G, "ide") and ide.CopyToClipboard then
     pcall(function() ide:CopyToClipboard(text) end)
   end
@@ -688,9 +749,48 @@ local function applyoperator(editor, state, operator, result, startpos)
   return false
 end
 
+local function ensureline(editor, line)
+  while line >= linecount(editor) do
+    editor:InsertText(editor:GetLength(), geteol(editor))
+  end
+end
+
+local function positionatcolumn(editor, line, column, pad)
+  ensureline(editor, line)
+  local pos = editor:FindColumn(line, column)
+  local actual = editor:GetColumn(pos)
+  if pad and actual < column then
+    local spaces = string.rep(" ", column - actual)
+    editor:InsertText(pos, spaces)
+    pos = pos + #spaces
+  end
+  return pos
+end
+
+local function pasteblock(editor, state, before, count)
+  local register = runtime.register
+  if readonly(editor) or not register.lines or #register.lines == 0 then return false end
+  local current = editor:GetCurrentPos()
+  local firstline = editor:LineFromPosition(current)
+  local column = editor:GetColumn(current) + (before and 0 or 1)
+  local cursor = current
+  withundo(editor, function()
+    for index, value in ipairs(register.lines) do
+      local line = firstline + index - 1
+      local pos = positionatcolumn(editor, line, column, true)
+      local text = repeattext(value, count)
+      editor:InsertText(pos, text)
+      if index == 1 then cursor = pos end
+    end
+  end)
+  gotonormal(editor, cursor)
+  return true
+end
+
 local function paste(editor, state, before, count)
   local register = runtime.register
   if readonly(editor) or not register or register.text == "" then return false end
+  if register.blockwise then return pasteblock(editor, state, before, count) end
   local text = repeattext(register.text, count)
   local pos = editor:GetCurrentPos()
   withundo(editor, function()
@@ -920,6 +1020,42 @@ local function closewhenidle(document, force)
   if rawget(_G, "ide") and ide.DoWhenIdle then ide:DoWhenIdle(close) else close() end
 end
 
+local function switchtab(editor, direction, count, absolute)
+  if not rawget(_G, "ide") or not ide.GetDocumentList then return false end
+  local documents = ide:GetDocumentList()
+  if #documents == 0 then return false end
+  local current = 1
+  for index, document in ipairs(documents) do
+    if document:GetEditor() == editor then current = index break end
+  end
+  local target
+  if absolute then
+    target = clamp(count, 1, #documents)
+  else
+    target = ((current - 1 + direction * count) % #documents) + 1
+  end
+  if documents[target].SetActive then documents[target]:SetActive() return true end
+  return false
+end
+
+local function scrollposition(editor, where)
+  local line = editor:LineFromPosition(editor:GetCurrentPos())
+  local visible = editor.VisibleFromDocLine and editor:VisibleFromDocLine(line) or line
+  local onscreen = editor.LinesOnScreen and editor:LinesOnScreen() or 1
+  if where == "center" then
+    if editor.VerticalCentreCaret then editor:VerticalCentreCaret()
+    elseif editor.SetFirstVisibleLine then
+      editor:SetFirstVisibleLine(math.max(0, visible - math.floor(onscreen / 2)))
+    end
+  elseif editor.SetFirstVisibleLine then
+    local first = where == "top" and visible
+      or math.max(0, visible - onscreen + 1)
+    editor:SetFirstVisibleLine(first)
+  end
+  editor:EnsureCaretVisible()
+  return true
+end
+
 local function executeex(editor, state, command)
   command = (command or ""):match("^%s*(.-)%s*$")
   if command == "" then return true end
@@ -961,6 +1097,16 @@ local function executeex(editor, state, command)
     if path and ide:LoadFile(path) then return true end
     setstatus(editor, state, "Vim: can't open " .. tostring(path))
     return false
+  elseif command == "tabnext" or command == "tabn" or command == "bnext" or command == "bn" then
+    return switchtab(editor, 1, 1, false)
+  elseif command == "tabprevious" or command == "tabp" or command == "bprevious" or command == "bp" then
+    return switchtab(editor, -1, 1, false)
+  elseif command == "tabfirst" then
+    return switchtab(editor, 1, 1, true)
+  elseif command == "tablast" then
+    return switchtab(editor, 1, 1000000, true)
+  elseif command:match("^tab%s+%d+$") then
+    return switchtab(editor, 1, tonumber(command:match("%d+")), true)
   elseif command == "set ignorecase" or command == "set ic" then
     runtime.config.ignorecase = true
   elseif command == "set noignorecase" or command == "set noic" then
@@ -995,7 +1141,68 @@ local function promptex(editor, state)
   return executeex(editor, state, command)
 end
 
+local function collectblock(editor, state)
+  local ranges, firstline, lastline, firstcol, lastcol = visualblockranges(editor, state)
+  local lines = {}
+  for index, range in ipairs(ranges) do
+    lines[index] = editor:GetTextRange(range.from, range.finish)
+  end
+  return ranges, lines, firstline, lastline, firstcol, lastcol
+end
+
+local function deleteblockranges(editor, ranges)
+  for index = #ranges, 1, -1 do
+    local range = ranges[index]
+    if range.finish > range.from then editor:DeleteRange(range.from, range.finish - range.from) end
+  end
+end
+
+local function applyvisualblock(editor, state, operator)
+  local ranges, lines, firstline, lastline, firstcol, lastcol = collectblock(editor, state)
+  local text = table.concat(lines, geteol(editor))
+  local cursor = positionatcolumn(editor, firstline, firstcol, false)
+  if operator == "y" then
+    saveregister(text, false, lines, lastcol - firstcol + 1)
+    setmode(editor, state, "normal")
+    gotonormal(editor, cursor)
+    setstatus(editor, state, "Vim: yanked block " .. #lines .. "x" .. (lastcol - firstcol + 1))
+    return true
+  end
+  if readonly(editor) then return false end
+  if operator == ">" or operator == "<" then
+    withundo(editor, function()
+      indentlines(editor, firstline, lastline, operator == ">" and 1 or -1)
+    end)
+    setmode(editor, state, "normal")
+    gotonormal(editor, firstnonblank(editor, firstline))
+    return true
+  elseif operator == "~" then
+    withundo(editor, function()
+      for index = #ranges, 1, -1 do
+        local range = ranges[index]
+        if range.finish > range.from then togglecase(editor, range.from, range.finish) end
+      end
+    end)
+    setmode(editor, state, "normal")
+    gotonormal(editor, cursor)
+    return true
+  elseif operator == "d" or operator == "c" then
+    saveregister(text, false, lines, lastcol - firstcol + 1)
+    if operator == "c" then
+      beginchange(editor, state, function() deleteblockranges(editor, ranges) end, cursor)
+    else
+      withundo(editor, function() deleteblockranges(editor, ranges) end)
+      state.mode = "normal"
+      setmode(editor, state, "normal")
+      gotonormal(editor, cursor)
+    end
+    return true
+  end
+  return false
+end
+
 local function applyvisual(editor, state, operator)
+  if state.mode == "visual_block" then return applyvisualblock(editor, state, operator) end
   local from, finish, linewise, first, last = visualrange(editor, state)
   local text = linewise and linewisetext(editor, first, last) or editor:GetTextRange(from, finish)
   if operator == "y" then
@@ -1040,8 +1247,28 @@ local function applyvisual(editor, state, operator)
   return false
 end
 
+local function pastevisualblock(editor, state)
+  if readonly(editor) or runtime.register.text == "" then return false end
+  local ranges, _, firstline, _, firstcol = collectblock(editor, state)
+  local source = runtime.register.lines or {runtime.register.text}
+  local cursor = positionatcolumn(editor, firstline, firstcol, false)
+  withundo(editor, function()
+    deleteblockranges(editor, ranges)
+    for index = 1, #ranges do
+      local line = firstline + index - 1
+      local pos = positionatcolumn(editor, line, firstcol, true)
+      editor:InsertText(pos, source[(index - 1) % #source + 1])
+    end
+  end)
+  state.mode = "normal"
+  setmode(editor, state, "normal")
+  gotonormal(editor, cursor)
+  return true
+end
+
 local function pastevisual(editor, state)
   if readonly(editor) or runtime.register.text == "" then return false end
+  if state.mode == "visual_block" then return pastevisualblock(editor, state) end
   local from, finish = visualrange(editor, state)
   local text = runtime.register.text
   withundo(editor, function()
@@ -1128,9 +1355,23 @@ local function handlenormalpending(editor, state, key)
 
   if pending.kind == "prefix" then
     local count, had = countvalue(pending.counttext), pending.counttext ~= ""
-    if pending.key == "g" and key == "g" then
-      local result = resolvemotion(editor, state, "gg", count, nil, had)
-      if result then moveresult(editor, state, result) end
+    if pending.key == "g" then
+      if key == "g" then
+        local result = resolvemotion(editor, state, "gg", count, nil, had)
+        if result then moveresult(editor, state, result) end
+      elseif key == "t" then
+        switchtab(editor, 1, count, had)
+      elseif key == "T" then
+        switchtab(editor, -1, count, false)
+      else
+        setstatus(editor, state, "Vim: unknown command g" .. key)
+      end
+    elseif pending.key == "z" and (key == "z" or key == ".") then
+      scrollposition(editor, "center")
+    elseif pending.key == "z" and key == "t" then
+      scrollposition(editor, "top")
+    elseif pending.key == "z" and key == "b" then
+      scrollposition(editor, "bottom")
     elseif pending.key == "Z" and (key == "Z" or key == "Q") then
       executeex(editor, state, key == "Z" and "wq" or "q!")
     else
@@ -1181,6 +1422,7 @@ local function simplenormal(editor, state, key, count, hadcount)
   elseif key == "O" then openline(editor, state, false)
   elseif key == "v" then entervisual(editor, state, false)
   elseif key == "V" then entervisual(editor, state, true)
+  elseif key == "<C-v>" then entervisualblock(editor, state)
   elseif key == "x" or key == "<Delete>" then deletechars(editor, state, false, count, false)
   elseif key == "X" then deletechars(editor, state, true, count, false)
   elseif key == "s" then deletechars(editor, state, false, count, true)
@@ -1247,7 +1489,7 @@ normaldispatch = function(editor, state, key)
     state.pending = {kind = "operator", op = key, pre = count, post = "", stage = "motion"}
     setstatus(editor, state)
     return true
-  elseif key == "g" or key == "Z" then
+  elseif key == "g" or key == "z" or key == "Z" then
     state.pending = {kind = "prefix", key = key, counttext = counttext}
     setstatus(editor, state)
     return true
@@ -1270,13 +1512,20 @@ local function visualdispatch(editor, state, key)
     setmode(editor, state, "normal")
     gotonormal(editor, pos)
     return true
-  elseif key == "v" and state.mode == "visual" or key == "V" and state.mode == "visual_line" then
+  elseif (key == "v" and state.mode == "visual")
+  or (key == "V" and state.mode == "visual_line")
+  or (key == "<C-v>" and state.mode == "visual_block") then
     local pos = state.visualcursor
     setmode(editor, state, "normal")
     gotonormal(editor, pos)
     return true
   elseif key == "v" then state.mode = "visual" refreshvisual(editor, state) setstatus(editor, state) return true
   elseif key == "V" then state.mode = "visual_line" refreshvisual(editor, state) setstatus(editor, state) return true
+  elseif key == "<C-v>" then
+    state.mode = "visual_block"
+    refreshvisual(editor, state)
+    setstatus(editor, state)
+    return true
   elseif key == "o" then
     state.visualanchor, state.visualcursor = state.visualcursor, state.visualanchor
     refreshvisual(editor, state)
@@ -1337,7 +1586,7 @@ local function dispatch(editor, key)
       return true
     end
     return false
-  elseif state.mode == "visual" or state.mode == "visual_line" then
+  elseif state.mode == "visual" or state.mode == "visual_line" or state.mode == "visual_block" then
     return visualdispatch(editor, state, key)
   end
   return normaldispatch(editor, state, key)
@@ -1374,7 +1623,7 @@ local function specialkey(event)
   if control then
     local value = code >= 0 and code <= 255 and string.char(code):lower() or ""
     local supported = {r = true, d = true, u = true, f = true, b = true,
-      e = true, y = true, ["["] = true, c = true}
+      e = true, y = true, v = true, ["["] = true, c = true}
     return supported[value] and ("<C-" .. value .. ">") or nil
   end
   if code == wxlib.WXK_TAB then
@@ -1434,11 +1683,40 @@ local function disconnecteditor(editor)
   charhandlers[editor], states[editor] = nil, nil
 end
 
+local function installctrlvhotkey()
+  if runtime.config.visualblock == false or runtime.config.overridectrlv == false
+  or not ide.GetHotKey or not ide.SetHotKey then return end
+  local originalid, shortcut = ide:GetHotKey("Ctrl-V")
+  local fakeid = ide:SetHotKey(function()
+    local editor = (ide.GetEditorWithFocus and ide:GetEditorWithFocus()) or ide:GetEditor()
+    if not editor then return end
+    local state = getstate(editor)
+    if state.mode == "insert" or state.mode == "replace" then
+      if editor.PasteDyn then editor:PasteDyn()
+      elseif editor.Paste then editor:Paste() end
+    else
+      dispatch(editor, "<C-v>")
+    end
+  end, shortcut or "Ctrl-V")
+  runtime.ctrlvhotkey = {fakeid = fakeid, originalid = originalid, shortcut = shortcut or "Ctrl-V"}
+end
+
+local function restorectrlvhotkey()
+  local hotkey = runtime.ctrlvhotkey
+  if not hotkey then return end
+  if hotkey.originalid and ide.SetHotKey then
+    ide:SetHotKey(hotkey.originalid, hotkey.shortcut)
+  elseif hotkey.fakeid and ide.SetAccelerator then
+    ide:SetAccelerator(hotkey.fakeid)
+  end
+  runtime.ctrlvhotkey = nil
+end
+
 local plugin = {
   name = "Vim Mode",
   description = "Modal Vim-style editing for ZeroBrane Studio.",
   author = "ZoneBraneVim contributors",
-  version = 0.1,
+  version = 0.2,
   dependencies = 1.61,
 
   onRegister = function(self)
@@ -1446,11 +1724,13 @@ local plugin = {
     runtime.enabled = runtime.config.enabled ~= false
     runtime.registered = true
     for _, document in ipairs(ide:GetDocumentList()) do connecteditor(document:GetEditor()) end
+    if runtime.enabled then installctrlvhotkey() end
     ide:Print("Vim Mode " .. VERSION .. " registered")
   end,
 
   onUnRegister = function(self)
     runtime.registered = false
+    restorectrlvhotkey()
     for _, document in ipairs(ide:GetDocumentList()) do disconnecteditor(document:GetEditor()) end
     if runtime.laststatus and ide:GetStatus(0) == runtime.laststatus then ide:SetStatus("", 0) end
     ide:Print("Vim Mode unregistered")
@@ -1502,7 +1782,8 @@ plugin._test = {
   reset = function()
     runtime.config = {status = false, clipboard = false, wrapscan = true, smartcase = true}
     runtime.enabled, runtime.registered = true, true
-    runtime.register = {text = "", linewise = false}
+    runtime.register = {text = "", linewise = false, blockwise = false}
+    runtime.ctrlvhotkey = nil
     runtime.lastsearch, runtime.searchforward = nil, true
     states = setmetatable({}, {__mode = "k"})
   end,
