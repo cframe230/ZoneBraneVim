@@ -104,19 +104,21 @@ test("insert mode groups typing into one undo step", function()
   equal(value:GetText(), "XYabc")
 end)
 
-test("Tab leaves Insert mode and the caret does not blink", function()
+test("Caps Lock leaves Insert mode while Tab stays native", function()
   local value = editor("abc")
   press(value, "i")
   equal(value.caretperiod, 0)
   value:TypeText("X")
-  press(value, "<Tab>")
+  equal(seam.dispatch(value, "<Tab>"), false, "Tab is passed to the native editor")
+  equal(seam.getstate(value).mode, "insert")
+  press(value, "<CapsLock>")
   equal(seam.getstate(value).mode, "normal")
-  equal(value:GetText(), "Xabc", "Tab is consumed instead of inserting indentation")
+  equal(value:GetText(), "Xabc")
   equal(value:GetCurrentPos(), 0)
 
-  seam.runtime.config.tabescape = false
-  press(value, "i", "<Tab>")
-  equal(seam.getstate(value).mode, "insert", "tabescape=false preserves native Tab behavior")
+  seam.runtime.config.capsescape = false
+  press(value, "i", "<CapsLock>")
+  equal(seam.getstate(value).mode, "insert", "capsescape=false preserves Caps Lock")
   press(value, "<Esc>")
 
   seam.runtime.config.cursorblink = true
@@ -508,7 +510,7 @@ test("plugin lifecycle connects character input and handles special keys", funct
   local printed, ctrlvcallback, restored = {}, nil, nil
   _G.wx = {
     wxEVT_CHAR = 1, wxID_ANY = -1,
-    WXK_TAB = 9,
+    WXK_TAB = 9, WXK_CAPITAL = 20,
     WXK_ESCAPE = 27, WXK_LEFT = 314, WXK_RIGHT = 316,
     WXK_UP = 315, WXK_DOWN = 317, WXK_HOME = 313, WXK_END = 312,
     WXK_BACK = 8, WXK_DELETE = 127, WXK_RETURN = 13, WXK_NUMPAD_ENTER = 370,
@@ -558,6 +560,16 @@ test("plugin lifecycle connects character input and handles special keys", funct
     MetaDown = function() return false end,
   }
   equal(plugin:onEditorKeyDown(value, escape), false)
+  equal(seam.getstate(value).mode, "normal")
+  value.handler(character)
+  equal(seam.getstate(value).mode, "insert")
+  local capslock = {
+    GetKeyCode = function() return 20 end,
+    ControlDown = function() return false end,
+    AltDown = function() return false end,
+    MetaDown = function() return false end,
+  }
+  equal(plugin:onEditorKeyDown(value, capslock), false)
   equal(seam.getstate(value).mode, "normal")
   local tab = {
     GetKeyCode = function() return 9 end,

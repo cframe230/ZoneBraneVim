@@ -1,8 +1,10 @@
 # ZoneBraneVim
 
+[English](README.en.md) | 中文
+
 一个面向 [ZeroBrane Studio](https://studio.zerobrane.com/) 的非官方 Vim 模式插件。它用单个 `vim.lua` 提供常用的模式化编辑、移动、操作符、搜索和少量 Ex 命令；不是 Vim/Neovim 的嵌入版本，也不追求完整兼容。
 
-- 当前版本：`0.2.0`
+- 当前版本：`0.2.1`
 - ZeroBrane Studio：`1.61+`
 - 许可证：MIT
 
@@ -51,7 +53,7 @@ cp ./vim.lua "$HOME/.zbstudio/packages/vim.lua"
 
 目标文件是 `/home/<用户名>/.zbstudio/packages/vim.lua`。
 
-也可把文件放进 ZeroBrane Studio 安装目录的 `packages/`，作为该安装实例的插件。完成后重启 IDE；Output 面板出现 `Vim Mode 0.2.0 registered` 即表示加载成功。
+也可把文件放进 ZeroBrane Studio 安装目录的 `packages/`，作为该安装实例的插件。完成后重启 IDE；Output 面板出现 `Vim Mode 0.2.1 registered` 即表示加载成功。
 
 ## 配置
 
@@ -61,7 +63,7 @@ cp ./vim.lua "$HOME/.zbstudio/packages/vim.lua"
 vim = {
   enabled = true,       -- 启用插件
   startinsert = false,  -- 新编辑器是否从 Insert 模式开始
-  tabescape = true,     -- Insert/Replace 中按 Tab 返回 Normal
+  capsescape = true,    -- Caps Lock（Bloq Mayús）等同 Esc
   cursorblink = false,  -- 关闭光标闪烁
   visualblock = true,   -- 启用 Ctrl-V Visual Block
   overridectrlv = true, -- 接管 Ctrl-V；Insert/Replace 中仍执行粘贴
@@ -117,7 +119,7 @@ vim = {
 
 ### Insert 与 Replace 模式
 
-普通输入和 ZeroBrane Studio 的编辑功能保持原样。按 `Tab`、`Shift-Tab`、`Esc`、`Ctrl-[` 或 `Ctrl-C` 返回 Normal 模式。若需要用 `Tab` 原生缩进，可设置 `vim.tabescape = false`。
+普通输入和 ZeroBrane Studio 的编辑功能保持原样，`Tab` 与 `Shift-Tab` 执行原生缩进。按 `Caps Lock（Bloq Mayús）`、`Esc`、`Ctrl-[` 或 `Ctrl-C` 返回 Normal 模式；Caps Lock 在 Normal/Visual 中也等同 `Esc`。可设置 `vim.capsescape = false` 禁用该映射。
 
 ### Visual / Visual Line / Visual Block 模式
 
